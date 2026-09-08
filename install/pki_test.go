@@ -5,6 +5,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -152,6 +153,35 @@ func TestSetupVMTLS_CreatesBothPlanes(t *testing.T) {
 	}
 	if string(snap) != string(again) {
 		t.Error("SetupVMTLS re-run rotated the management CA, want existing key material preserved")
+	}
+}
+
+// The agent must be pointed at the split-plane PKI: the systemd unit and
+// the docker-compose template pass both TLS flags, the agent config
+// template carries both TLS keys, and the compose template mounts the TLS
+// base directory into the agent container.
+func TestUnorchestratedTemplatesCarrySplitPlaneTLS(t *testing.T) {
+	for _, flag := range []string{
+		"-tlsCertPath=/var/lib/kubearmor/tls/log",
+		"-managementTLSCertPath=/var/lib/kubearmor/tls/management",
+	} {
+		if !strings.Contains(kubearmorServiceFile, flag) {
+			t.Errorf("kubearmor.service missing %q", flag)
+		}
+		if !strings.Contains(kubearmorcomposeTemplate, flag) {
+			t.Errorf("compose template missing %q", flag)
+		}
+	}
+	for _, key := range []string{
+		"tlsCertPath: /var/lib/kubearmor/tls/log",
+		"managementTLSCertPath: /var/lib/kubearmor/tls/management",
+	} {
+		if !strings.Contains(kubeArmorConfig, key) {
+			t.Errorf("config template missing %q", key)
+		}
+	}
+	if !strings.Contains(kubearmorcomposeTemplate, "/var/lib/kubearmor/tls:/var/lib/kubearmor/tls:ro") {
+		t.Error("compose template missing read-only TLS volume mount")
 	}
 }
 
