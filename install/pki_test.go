@@ -1,12 +1,17 @@
 package install
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"text/template"
+
+	"github.com/Masterminds/sprig"
+	"sigs.k8s.io/yaml"
 )
 
 func parseTestCert(t *testing.T, pemBytes []byte) *x509.Certificate {
@@ -182,6 +187,114 @@ func TestUnorchestratedTemplatesCarrySplitPlaneTLS(t *testing.T) {
 	}
 	if !strings.Contains(kubearmorcomposeTemplate, "/var/lib/kubearmor/tls:/var/lib/kubearmor/tls:ro") {
 		t.Error("compose template missing read-only TLS volume mount")
+	}
+}
+
+func sampleUnorchestratedConfig() *KubeArmorConfig {
+	return &KubeArmorConfig{
+		Hostname:                    "test-host",
+		KubeArmorImage:              "kubearmor/kubearmor:test",
+		KubeArmorInitImage:          "kubearmor/kubearmor-init:test",
+		ImagePullPolicy:             "always",
+		KubeArmorVisibility:         "process,network",
+		KubeArmorHostVisibility:     "process,network",
+		KubeArmorFilePosture:        "block",
+		KubeArmorNetworkPosture:     "block",
+		KubeArmorCapPosture:         "block",
+		KubeArmorHostFilePosture:    "block",
+		KubeArmorHostNetworkPosture: "block",
+		KubeArmorHostCapPosture:     "block",
+		KubeArmorAlertThrottling:    true,
+		KubeArmorMaxAlertsPerSec:    10,
+		KubeArmorThrottleSec:        30,
+		KubeArmorPort:               "32767",
+		SecureContainers:            false,
+	}
+}
+
+func renderTemplate(t *testing.T, name, tmpl string, data *KubeArmorConfig) map[string]interface{} {
+	t.Helper()
+	var buf bytes.Buffer
+	tpl, err := template.New(name).Funcs(sprig.GenericFuncMap()).Parse(tmpl)
+	if err != nil {
+		t.Fatalf("template %s does not parse: %v", name, err)
+	}
+	if err := tpl.Execute(&buf, data); err != nil {
+		t.Fatalf("template %s does not render: %v", name, err)
+	}
+	var out map[string]interface{}
+	if err := yaml.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("rendered %s is not valid YAML: %v", name, err)
+	}
+	return out
+}
+
+func strSlice(t *testing.T, v interface{}) []string {
+	t.Helper()
+	raw, ok := v.([]interface{})
+	if !ok {
+		t.Fatalf("expected a YAML list, got %T", v)
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		s, ok := item.(string)
+		if !ok {
+			t.Fatalf("expected list of strings, got %T", item)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// Render-level smoke test for the agent side: the compose and agent-config
+// templates must render to valid YAML carrying the split-plane TLS wiring
+// the agent needs to serve mTLS from the generated PKI layout.
+func TestUnorchestratedTemplatesRenderSplitPlaneTLS(t *testing.T) {
+	cfg := sampleUnorchestratedConfig()
+
+	compose := renderTemplate(t, "compose", kubearmorcomposeTemplate, cfg)
+	svcs, ok := compose["services"].(map[string]interface{})
+	if !ok {
+		t.Fatal("rendered compose has no services map")
+	}
+	agent, ok := svcs["kubearmor"].(map[string]interface{})
+	if !ok {
+		t.Fatal("rendered compose has no kubearmor service")
+	}
+	cmd := strSlice(t, agent["command"])
+	for _, want := range []string{
+		"-tlsCertPath=/var/lib/kubearmor/tls/log",
+		"-managementTLSCertPath=/var/lib/kubearmor/tls/management",
+	} {
+		found := false
+		for _, arg := range cmd {
+			if arg == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("rendered compose command missing %q (got %v)", want, cmd)
+		}
+	}
+	vols := strSlice(t, agent["volumes"])
+	found := false
+	for _, v := range vols {
+		if v == "/var/lib/kubearmor/tls:/var/lib/kubearmor/tls:ro" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("rendered compose volumes missing read-only TLS mount (got %v)", vols)
+	}
+
+	agentCfg := renderTemplate(t, "kubearmor-config", kubeArmorConfig, cfg)
+	if agentCfg["tlsCertPath"] != "/var/lib/kubearmor/tls/log" {
+		t.Errorf("rendered agent config tlsCertPath = %v", agentCfg["tlsCertPath"])
+	}
+	if agentCfg["managementTLSCertPath"] != "/var/lib/kubearmor/tls/management" {
+		t.Errorf("rendered agent config managementTLSCertPath = %v", agentCfg["managementTLSCertPath"])
 	}
 }
 
